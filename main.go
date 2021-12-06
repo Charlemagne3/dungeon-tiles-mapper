@@ -10,7 +10,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
@@ -29,33 +31,41 @@ const (
 	dropdownArrowOffsetX = 192
 	dropdownBarOffsetX   = 32
 	dropdownOffsetY      = 64
+	rotateLeftOffsetX    = 224
+	rotateRightOffsetX   = 256
 	selectedTileOffsetY  = 128
+	sizeOffset           = 448
 	saveOffsetX          = 32
 	saveOffsetY          = 448
 )
 
+var tileNameRE = regexp.MustCompile(`^(DT\d)_(\d{1,2}x\d{1,2}){0,1}_{0,1}(\w?\.?\w+\.[a|b])\.(0|90|180|270)\.(?:png|jpg|gif)$`)
+
 type Game struct {
 	CursorDrag *CursorDrag
-	Library    map[string]Tile // The set of available tiles
-	TileNames  []string        // The names of all tiles for sorting
-	Tiles      []*Tile         // The tiles places on the grid
-	Menu       Menu            // The menu with all options
-	Grid       Grid            // The grid where tiles are placed
-	Font       font.Face       // The font the menu is rendered with
+	Library    Library   // The set of available tiles
+	Tiles      []*Tile   // The tiles placed on the grid
+	Menu       Menu      // The menu with all options
+	Grid       Grid      // The grid where tiles are placed
+	Font       font.Face // The font the menu is rendered with
 	Save       bool
 }
 
 type Menu struct {
-	X             int
-	Y             int
-	Page          int
-	Image         *ebiten.Image
-	Header        *ebiten.Image
-	DropdownArrow *ebiten.Image
-	DropdownBar   *ebiten.Image
-	SaveButton    *ebiten.Image
-	SelectedTile  string
-	IsOpen        bool
+	X                   int
+	Y                   int
+	Page                int
+	Image               *ebiten.Image
+	Header              *ebiten.Image
+	DropdownArrow       *ebiten.Image
+	DropdownBar         *ebiten.Image
+	RotateLeft          *ebiten.Image
+	RotateRight         *ebiten.Image
+	SaveButton          *ebiten.Image
+	SelectedSet         string
+	SelectedTile        string
+	SelectedOrientation int
+	IsOpen              bool
 }
 
 func (m *Menu) GetX() int {
@@ -87,6 +97,8 @@ type Grid struct {
 type Tile struct {
 	X     int
 	Y     int
+	Name  string
+	Size  string
 	Image *ebiten.Image
 }
 
@@ -144,13 +156,35 @@ func (g *Game) Update() error {
 
 		w, h := g.Menu.SaveButton.Size()
 		r := image.Rect(g.Menu.X+saveOffsetX, g.Menu.Y+saveOffsetY, g.Menu.X+w+saveOffsetX, g.Menu.Y+h+saveOffsetY)
+
 		if IsPointInRect(x, y, r) {
 			g.Save = true
 			return nil
 		}
 
+		w, h = g.Menu.RotateLeft.Size()
+		r = image.Rect(g.Menu.X+rotateLeftOffsetX, g.Menu.Y+dropdownOffsetY, g.Menu.X+w+rotateLeftOffsetX, g.Menu.Y+h+dropdownOffsetY)
+
+		if IsPointInRect(x, y, r) {
+			if g.Menu.SelectedOrientation == 0 {
+				g.Menu.SelectedOrientation = 270
+			} else {
+				g.Menu.SelectedOrientation -= 90
+			}
+			return nil
+		}
+
+		w, h = g.Menu.RotateRight.Size()
+		r = image.Rect(g.Menu.X+rotateRightOffsetX, g.Menu.Y+dropdownOffsetY, g.Menu.X+w+rotateRightOffsetX, g.Menu.Y+h+dropdownOffsetY)
+
+		if IsPointInRect(x, y, r) {
+			g.Menu.SelectedOrientation = (g.Menu.SelectedOrientation + 90) % 360
+			return nil
+		}
+
 		w, h = g.Menu.DropdownBar.Size()
 		r = image.Rect(g.Menu.X+dropdownBarOffsetX, g.Menu.Y+dropdownOffsetY, g.Menu.X+w+dropdownBarOffsetX, g.Menu.Y+h+dropdownOffsetY)
+
 		if IsPointInRect(x, y, r) {
 			// If the drowdown is clicked, open or close it
 			g.Menu.IsOpen = !g.Menu.IsOpen
@@ -159,11 +193,12 @@ func (g *Game) Update() error {
 		// If menu is open, check for a click on a dropdown option
 		if g.Menu.IsOpen {
 			offset := 0
-			for i := g.Menu.Page * pageSize; i < g.Menu.Page*pageSize+pageSize && i < len(g.TileNames); i++ {
+
+			for i := g.Menu.Page * pageSize; i < g.Menu.Page*pageSize+pageSize && i < len(g.Library.Sets[g.Menu.SelectedSet].Keys); i++ {
 				offset += 32
 				r = image.Rect(g.Menu.X+dropdownBarOffsetX, g.Menu.Y+dropdownOffsetY+offset, g.Menu.X+w+dropdownBarOffsetX, g.Menu.Y+h+dropdownOffsetY+offset)
 				if IsPointInRect(x, y, r) {
-					g.Menu.SelectedTile = g.TileNames[i]
+					g.Menu.SelectedTile = g.Library.Sets[g.Menu.SelectedSet].Keys[i]
 					break
 				}
 			}
@@ -175,6 +210,7 @@ func (g *Game) Update() error {
 		// If the user clicked on the menu header, set up a cursor drag
 		w, h = g.Menu.Header.Size()
 		r = image.Rect(g.Menu.X, g.Menu.Y, g.Menu.X+w, g.Menu.Y+h)
+
 		if IsPointInRect(x, y, r) {
 			drag := &CursorDrag{
 				Origin: image.Point{X: x, Y: y},
@@ -185,7 +221,7 @@ func (g *Game) Update() error {
 		}
 
 		// If the user is not dragging the menu, check if they are dragging a new tile
-		w, h = g.Library[g.Menu.SelectedTile].Image.Size()
+		w, h = g.Library.Sets[g.Menu.SelectedSet].Values[g.Menu.SelectedTile][g.Menu.SelectedOrientation].Image.Size()
 		r = image.Rect(g.Menu.X+dropdownBarOffsetX, g.Menu.Y+selectedTileOffsetY, g.Menu.X+dropdownBarOffsetX+w, g.Menu.Y+selectedTileOffsetY+h)
 		if IsPointInRect(x, y, r) {
 			drag := &CursorDrag{
@@ -199,7 +235,7 @@ func (g *Game) Update() error {
 			tile := Tile{
 				X:     x - snapX,
 				Y:     y - snapY,
-				Image: g.Library[g.Menu.SelectedTile].Image,
+				Image: g.Library.Sets[g.Menu.SelectedSet].Values[g.Menu.SelectedTile][g.Menu.SelectedOrientation].Image,
 			}
 
 			drag.Target = &tile
@@ -212,6 +248,7 @@ func (g *Game) Update() error {
 			tile := g.Tiles[i]
 			w, h = tile.Image.Size()
 			r = image.Rect(tile.X, tile.Y, tile.X+w, tile.Y+h)
+
 			if IsPointInRect(x, y, r) {
 				drag := &CursorDrag{
 					Origin: image.Point{X: x, Y: y},
@@ -239,6 +276,27 @@ func (g *Game) Update() error {
 
 		g.CursorDrag.Target.SetX(g.CursorDrag.Target.GetX() + x - g.CursorDrag.Origin.X - snapX)
 		g.CursorDrag.Target.SetY(g.CursorDrag.Target.GetY() + y - g.CursorDrag.Origin.Y - snapY)
+
+		// Keep the target in frame so that it doesn't disappear
+		if g.CursorDrag.Target == &g.Menu {
+			g.CursorDrag.Target.SetY(Max(0, g.CursorDrag.Target.GetY()))
+			g.CursorDrag.Target.SetX(Max(0, g.CursorDrag.Target.GetX()))
+		} else {
+			bounds := g.CursorDrag.Target.GetImage().Bounds()
+			boundsX := bounds.Dx()
+			boundsY := bounds.Dy()
+			targetX := g.CursorDrag.Target.GetX()
+			targetY := g.CursorDrag.Target.GetY()
+			bufferX := (-targetX/32+1)*32 - boundsX
+			bufferY := (-targetY/32+1)*32 - boundsY
+
+			if targetX <= -boundsX {
+				g.CursorDrag.Target.SetX(targetX + bufferX)
+			}
+			if targetY <= -boundsY {
+				g.CursorDrag.Target.SetY(targetY + bufferY)
+			}
+		}
 
 		if g.CursorDrag.IsNewTile {
 			w, h := g.Menu.Image.Size()
@@ -316,7 +374,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	op.GeoM.Reset()
 	op.GeoM.Translate(float64(g.Menu.X+dropdownBarOffsetX), float64(g.Menu.Y+selectedTileOffsetY))
-	screen.DrawImage(g.Library[g.Menu.SelectedTile].Image, op)
+	screen.DrawImage(g.Library.Sets[g.Menu.SelectedSet].Values[g.Menu.SelectedTile][g.Menu.SelectedOrientation].Image, op)
 
 	op.GeoM.Reset()
 	op.GeoM.Translate(float64(g.Menu.X)+saveOffsetX, float64(g.Menu.Y+saveOffsetY))
@@ -330,14 +388,23 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	op.GeoM.Translate(float64(g.Menu.X)+dropdownArrowOffsetX, float64(g.Menu.Y+dropdownOffsetY))
 	screen.DrawImage(g.Menu.DropdownArrow, op)
 
+	op.GeoM.Reset()
+	op.GeoM.Translate(float64(g.Menu.X)+rotateLeftOffsetX, float64(g.Menu.Y+dropdownOffsetY))
+	screen.DrawImage(g.Menu.RotateLeft, op)
+
+	op.GeoM.Reset()
+	op.GeoM.Translate(float64(g.Menu.X)+rotateRightOffsetX, float64(g.Menu.Y+dropdownOffsetY))
+	screen.DrawImage(g.Menu.RotateRight, op)
+
 	if g.Menu.IsOpen {
 		y := 0
-		for i := g.Menu.Page * pageSize; i < g.Menu.Page*pageSize+pageSize && i < len(g.TileNames); i++ {
+		for i := g.Menu.Page * pageSize; i < g.Menu.Page*pageSize+pageSize && i < len(g.Library.Sets[g.Menu.SelectedSet].Keys); i++ {
+			k := g.Library.Sets[g.Menu.SelectedSet].Keys[i]
 			y += 32
 			op.GeoM.Reset()
 			op.GeoM.Translate(float64(g.Menu.X)+32, float64(g.Menu.Y+y+dropdownOffsetY))
 			screen.DrawImage(g.Menu.DropdownBar, op)
-			text.Draw(screen, g.TileNames[i], g.Font, g.Menu.X+32, g.Menu.Y+y+dropdownOffsetY+32, color.Black)
+			text.Draw(screen, g.Library.Sets[g.Menu.SelectedSet].Values[k][0].Name, g.Font, g.Menu.X+32, g.Menu.Y+y+dropdownOffsetY+32, color.Black)
 		}
 	}
 
@@ -361,16 +428,84 @@ func main() {
 	defer dir.Close()
 
 	files, _ := dir.Readdir(0)
-	library := make(map[string]Tile, 848)
+
+	sets := map[string]string{
+		"DT1": "Dungeon Tiles",
+		"DT2": "Arcane Corridors",
+		"DT3": "Hidden Crypts",
+		"DT4": "Ruins of the Wild",
+	}
+
+	keys := map[string][]string{
+		"Dungeon Tiles":     {},
+		"Arcane Corridors":  {},
+		"Hidden Crypts":     {},
+		"Ruins of the Wild": {},
+	}
+
+	values := map[string]map[string]map[int]Tile{
+		"Dungeon Tiles":     {},
+		"Arcane Corridors":  {},
+		"Hidden Crypts":     {},
+		"Ruins of the Wild": {},
+	}
+
 	for _, f := range files {
-		image, _, err := ebitenutil.NewImageFromFile("./tiles/" + f.Name())
+		name := f.Name()
+		image, _, err := ebitenutil.NewImageFromFile("./tiles/" + name)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		library[f.Name()] = Tile{
+		t := tileNameRE.FindStringSubmatch(name)
+		set := sets[t[1]]
+		size := t[2]
+		n := t[3]
+		orientation := t[4]
+		o, err := strconv.Atoi(orientation)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if o == 0 {
+			keys[set] = append(keys[set], n)
+		}
+
+		if values[set][n] == nil {
+			values[set][n] = make(map[int]Tile, 4)
+		}
+
+		values[set][n][o] = Tile{
+			Size:  size,
+			Name:  n,
 			Image: image,
 		}
+	}
+
+	sort.Strings(keys["Dungeon Tiles"])
+	sort.Strings(keys["Arcane Corridors"])
+	sort.Strings(keys["Hidden Crypts"])
+	sort.Strings(keys["Ruins of the Wild"])
+
+	library := Library{
+		Sets: map[string]Set{
+			"Dungeon Tiles": {
+				Keys:   keys["Dungeon Tiles"],
+				Values: values["Dungeon Tiles"],
+			},
+			"Arcane Corridors": {
+				Keys:   keys["Arcane Corridors"],
+				Values: values["Arcane Corridors"],
+			},
+			"Hidden Crypts": {
+				Keys:   keys["Hidden Crypts"],
+				Values: values["Hidden Crypts"],
+			},
+			"Ruins of the Wild": {
+				Keys:   keys["Ruins of the Wild"],
+				Values: values["Ruins of the Wild"],
+			},
+		},
 	}
 
 	grid, _, err := ebitenutil.NewImageFromFile("./grid.png")
@@ -398,6 +533,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	rotateLeft, _, err := ebitenutil.NewImageFromFile("./rotate_left.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	rotateRight, _, err := ebitenutil.NewImageFromFile("./rotate_right.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	save, _, err := ebitenutil.NewImageFromFile("./save_icon.png")
 	if err != nil {
 		log.Fatal(err)
@@ -417,30 +562,27 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tileNames := make([]string, 0, len(library))
-	for k := range library {
-		tileNames = append(tileNames, k)
-	}
-	sort.Strings(tileNames)
-
 	g := &Game{
-		Library:   library,
-		Tiles:     []*Tile{},
-		TileNames: tileNames,
+		Library: library,
+		Tiles:   []*Tile{},
 		Grid: Grid{
 			X:     39,
 			Y:     22,
 			Image: grid,
 		},
 		Menu: Menu{
-			X:             512,
-			Y:             0,
-			Image:         menu,
-			Header:        header,
-			DropdownArrow: dropdownArrow,
-			DropdownBar:   dropdownBar,
-			SaveButton:    save,
-			SelectedTile:  "DT1_4x8_Ruins.b.0.jpg",
+			X:                   512,
+			Y:                   0,
+			Image:               menu,
+			Header:              header,
+			DropdownArrow:       dropdownArrow,
+			DropdownBar:         dropdownBar,
+			RotateLeft:          rotateLeft,
+			RotateRight:         rotateRight,
+			SaveButton:          save,
+			SelectedSet:         "Dungeon Tiles",
+			SelectedTile:        library.Sets["Dungeon Tiles"].Keys[0],
+			SelectedOrientation: 0,
 		},
 		Font: face,
 	}
@@ -448,4 +590,20 @@ func main() {
 	if err := ebiten.RunGame(g); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
+
+type Library struct {
+	Sets map[string]Set
+}
+
+type Set struct {
+	Keys   []string
+	Values map[string]map[int]Tile
 }
