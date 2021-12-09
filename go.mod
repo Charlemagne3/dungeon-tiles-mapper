@@ -1,4 +1,4 @@
-module ebiten-demo
+module dungeon-tiles-mapper
 
 go 1.17
 
